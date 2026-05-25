@@ -1,0 +1,17 @@
+# Cache
+.tr181_cache.json
+
+# XML data (downloaded separately)
+*.xml
+
+# OMC
+.omc/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+*~

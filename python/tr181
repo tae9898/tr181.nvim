@@ -1,0 +1,761 @@
+#!/usr/bin/env python3
+"""
+tr181 - TR-181 Device Data Model CLI Tool
+Broadband Forum TR-181 XML 스펙을 CLI에서 빠르게 검색/조회하는 도구
+
+Usage:
+  tr181 search <keyword>         # 경로/설명에서 키워드 검색
+  tr181 show <path>              # 특정 object/parameter 상세 보기
+  tr181 list [path_prefix]       # object 목록 보기
+  tr181 params <object_path>     # object의 parameter 목록
+  tr181 tree [path_prefix]       # 트리 구조로 보기
+  tr181 fzf                      # fzf 인터랙티브 검색 (fzf 필요)
+"""
+
+import sys
+import os
+import re
+import json
+import argparse
+import textwrap
+from pathlib import Path
+from xml.etree import ElementTree as ET
+
+# ─── 색상 상수 ────────────────────────────────────────────────────────────────
+RESET  = "\033[0m"
+BOLD   = "\033[1m"
+DIM    = "\033[2m"
+RED    = "\033[31m"
+GREEN  = "\033[32m"
+YELLOW = "\033[33m"
+BLUE   = "\033[34m"
+CYAN   = "\033[36m"
+WHITE  = "\033[37m"
+GRAY   = "\033[90m"
+
+def c(text, *codes):
+    if not sys.stdout.isatty() and not os.environ.get("TR181_COLOR"):
+        return str(text)
+    return "".join(codes) + str(text) + RESET
+
+# ─── XML 네임스페이스 ─────────────────────────────────────────────────────────
+NS = {
+    "dm":  "urn:broadband-forum-org:cwmp:datamodel-1-15",
+    "dmr": "urn:broadband-forum-org:cwmp:datamodel-report-1-0",
+}
+# 다양한 버전 네임스페이스 지원
+NS_PATTERNS = [
+    "urn:broadband-forum-org:cwmp:datamodel-1-15",
+    "urn:broadband-forum-org:cwmp:datamodel-1-14",
+    "urn:broadband-forum-org:cwmp:datamodel-1-13",
+    "urn:broadband-forum-org:cwmp:datamodel-1-12",
+    "urn:broadband-forum-org:cwmp:datamodel-1-11",
+    "urn:broadband-forum-org:cwmp:datamodel-1-10",
+    "urn:broadband-forum-org:cwmp:datamodel-1-9",
+    "urn:broadband-forum-org:cwmp:datamodel-1-8",
+]
+
+# ─── 캐시 경로 ────────────────────────────────────────────────────────────────
+TOOL_DIR = Path(__file__).parent
+CACHE_FILE = TOOL_DIR / ".tr181_cache.json"
+
+# ─── XML 파일 위치 탐색 ───────────────────────────────────────────────────────
+def find_xml_file():
+    """TR-181 XML 파일을 자동으로 탐색"""
+    candidates = []
+
+    # 환경변수 우선
+    env_path = os.environ.get("TR181_XML")
+    if env_path:
+        candidates.append(Path(env_path))
+
+    # 도구 디렉토리 내 XML 파일
+    candidates.extend(sorted(TOOL_DIR.glob("tr-181-*.xml"), reverse=True))
+
+    # 일반적인 설치 경로
+    candidates.extend([
+        Path.home() / ".tr181" / "tr-181.xml",
+        Path("/usr/local/share/tr181/tr-181.xml"),
+        Path("/opt/tr181/tr-181.xml"),
+    ])
+
+    for p in candidates:
+        if p.exists():
+            return p
+
+    return None
+
+# ─── XML 파싱 및 캐시 ─────────────────────────────────────────────────────────
+def detect_namespace(xml_file):
+    """XML 파일의 실제 네임스페이스 감지"""
+    with open(xml_file, "r", encoding="utf-8") as f:
+        for line in f:
+            for ns in NS_PATTERNS:
+                if ns in line:
+                    return ns
+    return NS_PATTERNS[0]
+
+def clean_description(text):
+    """XML description 텍스트 정리"""
+    if not text:
+        return ""
+    # 여러 줄 공백 정규화
+    text = re.sub(r'\s+', ' ', text).strip()
+    # {{bibref|...}} 등 매크로 제거
+    text = re.sub(r'\{\{[^}]+\}\}', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+def parse_xml(xml_file):
+    """XML 파싱하여 objects/parameters 딕셔너리 반환"""
+    xml_file = Path(xml_file)
+
+    print(c(f"  Parsing {xml_file.name} ...", DIM), file=sys.stderr)
+
+    tree = ET.parse(xml_file)
+    root = tree.getroot()
+
+    objects = {}   # path -> {description, access, version, minEntries, maxEntries}
+    params  = {}   # "ObjPath::ParamName" -> {description, access, syntax, version}
+
+    # model 요소 찾기 (네임스페이스 무관하게 태그명으로 탐색)
+    for ch in root:
+        tag = ch.tag.split("}")[-1] if "}" in ch.tag else ch.tag
+        if tag != "model":
+            continue
+        model = ch
+
+        for obj in model.findall(".//{*}object"):
+            obj_name   = obj.get("name", "")
+            obj_access = obj.get("access", "")
+            obj_version= obj.get("version", "")
+            obj_min    = obj.get("minEntries", "")
+            obj_max    = obj.get("maxEntries", "")
+
+            desc_el  = obj.find("{*}description")
+            obj_desc = clean_description(desc_el.text if desc_el is not None else "")
+
+            objects[obj_name] = {
+                "path":        obj_name,
+                "description": obj_desc,
+                "access":      obj_access,
+                "version":     obj_version,
+                "minEntries":  obj_min,
+                "maxEntries":  obj_max,
+                "params":      [],
+            }
+
+            for param in obj.findall("{*}parameter"):
+                p_name    = param.get("name", "")
+                p_access  = param.get("access", "")
+                p_version = param.get("version", "")
+
+                p_desc_el = param.find("{*}description")
+                p_desc    = clean_description(p_desc_el.text if p_desc_el is not None else "")
+
+                # syntax 파싱
+                syntax_info = parse_syntax(param)
+
+                full_key = f"{obj_name}{p_name}"
+                params[full_key] = {
+                    "path":        full_key,
+                    "obj_path":    obj_name,
+                    "name":        p_name,
+                    "description": p_desc,
+                    "access":      p_access,
+                    "version":     p_version,
+                    "syntax":      syntax_info,
+                }
+                objects[obj_name]["params"].append(p_name)
+
+    return objects, params
+
+def parse_syntax(param_el):
+    """parameter syntax 요소 파싱 (네임스페이스 무관)"""
+    syntax_el = param_el.find("{*}syntax")
+    if syntax_el is None:
+        return {"type": "unknown"}
+
+    info = {}
+
+    # 기본 타입 감지
+    for type_tag in ["string", "boolean", "int", "unsignedInt", "long",
+                     "unsignedLong", "dateTime", "hexBinary", "base64",
+                     "decimal", "float"]:
+        el = syntax_el.find(f"{{*}}{type_tag}")
+        if el is not None:
+            info["type"] = type_tag
+            # size 제약
+            size_el = el.find("{*}size")
+            if size_el is not None:
+                info["size"] = {k: v for k, v in size_el.attrib.items()}
+            # range 제약
+            range_el = el.find("{*}range")
+            if range_el is not None:
+                info["range"] = {k: v for k, v in range_el.attrib.items()}
+            # enumeration
+            enums = [e.get("value", "") for e in el.findall("{*}enumeration")]
+            if enums:
+                info["enumeration"] = enums
+            # pattern
+            patterns = [p.get("value", "") for p in el.findall("{*}pattern")]
+            if patterns:
+                info["pattern"] = patterns
+            break
+
+    # list 여부
+    if syntax_el.find("{*}list") is not None:
+        info["list"] = True
+
+    # dataType ref
+    dt_el = syntax_el.find("{*}dataType")
+    if dt_el is not None:
+        info["dataType"] = dt_el.get("ref", "")
+        if "type" not in info:
+            info["type"] = f"dataType({info['dataType']})"
+
+    if "type" not in info:
+        info["type"] = "unknown"
+
+    return info
+
+def load_or_build_cache(xml_file):
+    """캐시 파일이 있으면 로드, 없으면 파싱 후 캐시 저장"""
+    xml_path = Path(xml_file)
+    xml_mtime = xml_path.stat().st_mtime
+
+    if CACHE_FILE.exists():
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+            if cache.get("mtime") == xml_mtime and cache.get("source") == str(xml_path):
+                return cache["objects"], cache["params"]
+        except Exception:
+            pass
+
+    objects, params = parse_xml(xml_file)
+
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "mtime":   xml_mtime,
+                "source":  str(xml_path),
+                "objects": objects,
+                "params":  params,
+            }, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+    return objects, params
+
+# ─── 출력 헬퍼 ────────────────────────────────────────────────────────────────
+def fmt_access(access):
+    if access == "readWrite":
+        return c("readWrite", GREEN)
+    elif access == "readOnly":
+        return c("readOnly", GRAY)
+    elif access == "writeOnceReadOnly":
+        return c("writeOnceReadOnly", YELLOW)
+    return c(access, DIM)
+
+def fmt_type(syntax):
+    t = syntax.get("type", "unknown")
+    is_list = syntax.get("list", False)
+    prefix = c("list of ", CYAN) if is_list else ""
+
+    enums = syntax.get("enumeration", [])
+    if enums:
+        short = ", ".join(enums[:4])
+        if len(enums) > 4:
+            short += f", ... (+{len(enums)-4})"
+        return prefix + c(t, YELLOW) + c(f" [{short}]", DIM)
+
+    rng = syntax.get("range", {})
+    size = syntax.get("size", {})
+    constraint = ""
+    if rng:
+        parts = []
+        if "minInclusive" in rng: parts.append(f"min={rng['minInclusive']}")
+        if "maxInclusive" in rng: parts.append(f"max={rng['maxInclusive']}")
+        constraint = c(f" ({', '.join(parts)})", DIM)
+    elif size:
+        parts = []
+        if "minLength" in size: parts.append(f"minLen={size['minLength']}")
+        if "maxLength" in size: parts.append(f"maxLen={size['maxLength']}")
+        constraint = c(f" ({', '.join(parts)})", DIM)
+
+    return prefix + c(t, YELLOW) + constraint
+
+def wrap_desc(text, width=72, indent="  "):
+    if not text:
+        return c("  (no description)", DIM)
+    lines = textwrap.wrap(text, width=width)
+    return "\n".join(indent + l for l in lines)
+
+def print_separator(char="─", width=78):
+    print(c(char * width, DIM))
+
+def print_object(obj, show_params=True, params_dict=None):
+    """Object 상세 출력"""
+    print_separator()
+    print(c("OBJECT", BOLD + BLUE) + "  " + c(obj["path"], BOLD + WHITE))
+    print_separator()
+
+    print(c("  Access:   ", DIM) + fmt_access(obj.get("access", "")))
+    if obj.get("version"):
+        print(c("  Since:    ", DIM) + c(f"v{obj['version']}", CYAN))
+    entries = f"{obj.get('minEntries','?')}..{obj.get('maxEntries','?')}"
+    print(c("  Entries:  ", DIM) + c(entries, CYAN))
+
+    desc = obj.get("description", "")
+    if desc:
+        print()
+        print(c("  Description:", DIM))
+        print(wrap_desc(desc, indent="    "))
+
+    if show_params and obj.get("params"):
+        print()
+        print(c(f"  Parameters ({len(obj['params'])}):", DIM))
+        for pname in obj["params"]:
+            full_key = obj["path"] + pname
+            if params_dict and full_key in params_dict:
+                p = params_dict[full_key]
+                type_str = fmt_type(p.get("syntax", {}))
+                acc = fmt_access(p.get("access", ""))
+                print(f"    {c(pname, WHITE)}  {type_str}  {acc}")
+            else:
+                print(f"    {c(pname, WHITE)}")
+    print()
+
+def print_param(param):
+    """Parameter 상세 출력"""
+    print_separator()
+    print(c("PARAMETER", BOLD + GREEN) + "  " + c(param["path"], BOLD + WHITE))
+    print_separator()
+
+    print(c("  Object:   ", DIM) + c(param["obj_path"], CYAN))
+    print(c("  Name:     ", DIM) + c(param["name"], WHITE))
+    print(c("  Access:   ", DIM) + fmt_access(param.get("access", "")))
+    print(c("  Type:     ", DIM) + fmt_type(param.get("syntax", {})))
+    if param.get("version"):
+        print(c("  Since:    ", DIM) + c(f"v{param['version']}", CYAN))
+
+    syntax = param.get("syntax", {})
+    enums = syntax.get("enumeration", [])
+    if enums:
+        print()
+        print(c("  Enumeration values:", DIM))
+        for e in enums:
+            print(f"    {c(e, YELLOW)}")
+
+    patterns = syntax.get("pattern", [])
+    if patterns:
+        print()
+        print(c("  Pattern:", DIM))
+        for p in patterns:
+            print(f"    {c(p, CYAN)}")
+
+    desc = param.get("description", "")
+    if desc:
+        print()
+        print(c("  Description:", DIM))
+        print(wrap_desc(desc, indent="    "))
+    print()
+
+# ─── 서브커맨드 구현 ──────────────────────────────────────────────────────────
+
+def cmd_search(args, objects, params):
+    """경로 및 설명에서 키워드 검색"""
+    keyword = args.keyword.lower()
+    limit = args.limit
+    results = []
+
+    # Object 검색
+    for path, obj in objects.items():
+        score = 0
+        if keyword in path.lower():
+            score += 10
+        if keyword in obj.get("description", "").lower():
+            score += 5
+        if score:
+            results.append(("object", score, obj))
+
+    # Parameter 검색
+    for key, param in params.items():
+        score = 0
+        if keyword in key.lower():
+            score += 10
+        if keyword in param.get("description", "").lower():
+            score += 3
+        if score:
+            results.append(("param", score, param))
+
+    results.sort(key=lambda x: -x[1])
+
+    if not results:
+        print(c(f"  No results for '{keyword}'", RED))
+        return
+
+    count = 0
+    for kind, score, item in results:
+        if count >= limit:
+            remaining = len(results) - count
+            print(c(f"  ... {remaining} more results (use --limit to show more)", DIM))
+            break
+
+        if kind == "object":
+            tag = c("[OBJ]", BOLD + BLUE)
+            path = c(item["path"], WHITE)
+            desc = item.get("description", "")
+            short_desc = (desc[:60] + "...") if len(desc) > 60 else desc
+            print(f"  {tag} {path}")
+            if short_desc:
+                print(f"       {c(short_desc, DIM)}")
+        else:
+            tag = c("[PAR]", BOLD + GREEN)
+            path = c(item["path"], WHITE)
+            type_str = fmt_type(item.get("syntax", {}))
+            desc = item.get("description", "")
+            short_desc = (desc[:60] + "...") if len(desc) > 60 else desc
+            print(f"  {tag} {path}  {type_str}")
+            if short_desc:
+                print(f"       {c(short_desc, DIM)}")
+        count += 1
+
+    print()
+    print(c(f"  Found {len(results)} result(s) for '{keyword}'", DIM))
+
+def cmd_show(args, objects, params):
+    """특정 경로 상세 보기"""
+    path = args.path.strip()
+
+    # 정확히 일치하는 object
+    if path in objects:
+        print_object(objects[path], show_params=True, params_dict=params)
+        return
+
+    # 정확히 일치하는 parameter
+    if path in params:
+        print_param(params[path])
+        return
+
+    # 끝에 . 붙여서 재시도 (object)
+    if not path.endswith("."):
+        if path + "." in objects:
+            print_object(objects[path + "."], show_params=True, params_dict=params)
+            return
+
+    # 부분 일치 검색
+    matches_obj = [k for k in objects if path.lower() in k.lower()]
+    matches_par = [k for k in params if path.lower() in k.lower()]
+
+    if not matches_obj and not matches_par:
+        print(c(f"  Not found: '{path}'", RED))
+        print(c("  Try: tr181 search <keyword>", DIM))
+        return
+
+    if len(matches_obj) == 1 and not matches_par:
+        print_object(objects[matches_obj[0]], show_params=True, params_dict=params)
+        return
+
+    if len(matches_par) == 1 and not matches_obj:
+        print_param(params[matches_par[0]])
+        return
+
+    # 여러 결과 - 목록 출력
+    print(c(f"  Multiple matches for '{path}':", YELLOW))
+    for m in matches_obj[:10]:
+        print(f"  {c('[OBJ]', BLUE)} {m}")
+    for m in matches_par[:10]:
+        print(f"  {c('[PAR]', GREEN)} {m}")
+    if len(matches_obj) + len(matches_par) > 20:
+        print(c(f"  ... use a more specific path", DIM))
+
+def cmd_list(args, objects, params):
+    """Object 목록 출력"""
+    prefix = (args.prefix or "").strip()
+    depth  = args.depth
+
+    filtered = []
+    for path in sorted(objects.keys()):
+        if prefix and not path.lower().startswith(prefix.lower()):
+            continue
+
+        # depth 계산: prefix 이후의 점 개수
+        rel = path[len(prefix):]
+        rel_depth = rel.count(".")
+        if depth and rel_depth > depth:
+            continue
+
+        filtered.append(path)
+
+    if not filtered:
+        print(c(f"  No objects found with prefix '{prefix}'", RED))
+        return
+
+    for path in filtered:
+        obj = objects[path]
+        n_params = len(obj.get("params", []))
+        is_table = obj.get("maxEntries", "1") != "1"
+        table_mark = c(" [table]", CYAN) if is_table else ""
+        desc = obj.get("description", "")
+        short_desc = (desc[:50] + "...") if len(desc) > 50 else desc
+        print(f"  {c(path, WHITE)}{table_mark}  {c(f'({n_params} params)', DIM)}")
+        if args.desc and short_desc:
+            print(f"    {c(short_desc, DIM)}")
+
+    print()
+    print(c(f"  {len(filtered)} object(s)", DIM))
+
+def cmd_params(args, objects, params):
+    """특정 Object의 Parameter 목록"""
+    path = args.path.strip()
+    if not path.endswith("."):
+        path += "."
+
+    if path not in objects:
+        # 부분 일치
+        matches = [k for k in objects if path.lower() in k.lower()]
+        if not matches:
+            print(c(f"  Object not found: '{path}'", RED))
+            return
+        if len(matches) > 1:
+            print(c(f"  Multiple matches:", YELLOW))
+            for m in matches[:10]:
+                print(f"    {m}")
+            return
+        path = matches[0]
+
+    obj = objects[path]
+    print(c(f"  {path}", BOLD + WHITE))
+    print_separator()
+
+    param_names = obj.get("params", [])
+    if not param_names:
+        print(c("  (no parameters)", DIM))
+        return
+
+    for pname in param_names:
+        full_key = path + pname
+        if full_key in params:
+            p = params[full_key]
+            type_str = fmt_type(p.get("syntax", {}))
+            acc = fmt_access(p.get("access", ""))
+            ver = c(f" v{p['version']}", DIM) if p.get("version") else ""
+            print(f"  {c(pname, WHITE):<40} {type_str:<30} {acc}{ver}")
+        else:
+            print(f"  {c(pname, WHITE)}")
+
+    print()
+    print(c(f"  {len(param_names)} parameter(s)", DIM))
+
+def cmd_tree(args, objects, params):
+    """트리 구조로 출력"""
+    prefix = (args.prefix or "Device.").strip()
+    if not prefix.endswith("."):
+        prefix += "."
+    max_depth = args.depth or 3
+
+    # prefix 자체의 세그먼트 수 (Device. = 1, Device.WiFi. = 2)
+    base_segs = len([s for s in prefix.rstrip(".").split(".") if s])
+
+    filtered = sorted([
+        p for p in objects
+        if p.startswith(prefix)
+    ])
+
+    if not filtered:
+        print(c(f"  No objects found under '{prefix}'", RED))
+        return
+
+    for path in filtered:
+        # 현재 경로의 세그먼트 수
+        path_segs = len([s for s in path.rstrip(".").split(".") if s])
+        rel_depth = path_segs - base_segs  # prefix 대비 상대 심도
+
+        if rel_depth > max_depth:
+            continue
+
+        indent = "  " + "  " * rel_depth
+
+        # 마지막 두 세그먼트 표시 (e.g. Radio.{i} 또는 Stats)
+        raw_segs = path.rstrip(".").split(".")
+        # prefix 세그먼트 수
+        prefix_seg_count = len([s for s in prefix.rstrip(".").split(".") if s])
+        after_segs = raw_segs[prefix_seg_count:]
+        # 마지막 1개 세그먼트 (rel_depth==0이면 prefix 자체)
+        if after_segs:
+            display_name = after_segs[-1]
+        else:
+            display_name = raw_segs[-1]
+
+        obj = objects[path]
+        n_params = len(obj.get("params", []))
+        params_info = c(f" ({n_params}p)", DIM)
+
+        print(f"{indent}{c(display_name, WHITE)}{params_info}")
+
+def cmd_fzf(args, objects, params):
+    """fzf 인터랙티브 검색"""
+    import subprocess
+    import shutil
+
+    if not shutil.which("fzf"):
+        print(c("  fzf is not installed.", RED))
+        print(c("  Install: sudo apt install fzf  or  brew install fzf", DIM))
+        sys.exit(1)
+
+    # fzf 입력 생성
+    lines = []
+    for path, obj in objects.items():
+        desc = obj.get("description", "")
+        short = (desc[:60] + "...") if len(desc) > 60 else desc
+        n = len(obj.get("params", []))
+        lines.append(f"[OBJ] {path:<60}  ({n}p)  {short}")
+
+    for key, param in params.items():
+        t = param.get("syntax", {}).get("type", "")
+        desc = param.get("description", "")
+        short = (desc[:50] + "...") if len(desc) > 50 else desc
+        lines.append(f"[PAR] {key:<60}  {t:<15}  {short}")
+
+    input_text = "\n".join(lines)
+
+    # fzf 실행
+    fzf_cmd = [
+        "fzf",
+        "--ansi",
+        "--height=80%",
+        "--layout=reverse",
+        "--border",
+        "--prompt=TR-181> ",
+        "--header=TAB: multi-select  ENTER: show detail",
+        "--preview",
+        f"echo {{}} | awk '{{print $2}}' | xargs -I PATH {sys.argv[0]} show PATH 2>/dev/null",
+        "--preview-window=right:50%:wrap",
+    ]
+
+    try:
+        result = subprocess.run(
+            fzf_cmd,
+            input=input_text,
+            capture_output=False,
+            text=True,
+        )
+        if result.returncode == 0:
+            pass  # 선택된 항목은 fzf preview에서 이미 표시됨
+    except KeyboardInterrupt:
+        pass
+
+def cmd_stats(args, objects, params):
+    """통계 정보 출력"""
+    n_obj = len(objects)
+    n_par = len(params)
+    n_rw  = sum(1 for p in params.values() if p.get("access") == "readWrite")
+    n_ro  = sum(1 for p in params.values() if p.get("access") == "readOnly")
+    n_tbl = sum(1 for o in objects.values() if o.get("maxEntries", "1") != "1")
+
+    xml_path = find_xml_file()
+
+    print_separator()
+    print(c("  TR-181 Data Model Statistics", BOLD + WHITE))
+    print_separator()
+    if xml_path:
+        print(c("  Source:     ", DIM) + c(str(xml_path.name), CYAN))
+    print(c("  Objects:    ", DIM) + c(str(n_obj), WHITE))
+    print(c("  Tables:     ", DIM) + c(str(n_tbl), WHITE) + c(" (multi-instance)", DIM))
+    print(c("  Parameters: ", DIM) + c(str(n_par), WHITE))
+    print(c("  ReadWrite:  ", DIM) + c(str(n_rw), GREEN))
+    print(c("  ReadOnly:   ", DIM) + c(str(n_ro), GRAY))
+    print()
+
+# ─── 메인 ─────────────────────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(
+        prog="tr181",
+        description="TR-181 Device Data Model CLI Tool",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""
+        Examples:
+          tr181 search WiFi
+          tr181 search "IP interface"
+          tr181 show Device.WiFi.
+          tr181 show Device.WiFi.Radio.{i}.Channel
+          tr181 list Device.WiFi.
+          tr181 params Device.WiFi.Radio.{i}.
+          tr181 tree Device.WiFi. --depth 3
+          tr181 fzf
+          tr181 stats
+        """)
+    )
+    parser.add_argument("--xml", help="TR-181 XML file path (overrides TR181_XML env)")
+    parser.add_argument("--no-cache", action="store_true", help="Disable cache")
+
+    sub = parser.add_subparsers(dest="command")
+
+    # search
+    p_search = sub.add_parser("search", help="Search by keyword")
+    p_search.add_argument("keyword", help="Search keyword")
+    p_search.add_argument("--limit", type=int, default=30, help="Max results (default: 30)")
+
+    # show
+    p_show = sub.add_parser("show", help="Show object or parameter details")
+    p_show.add_argument("path", help="Object or parameter path")
+
+    # list
+    p_list = sub.add_parser("list", help="List objects")
+    p_list.add_argument("prefix", nargs="?", default="", help="Path prefix filter")
+    p_list.add_argument("--depth", type=int, default=0, help="Max depth (0=all)")
+    p_list.add_argument("--desc", action="store_true", help="Show descriptions")
+
+    # params
+    p_params = sub.add_parser("params", help="List parameters of an object")
+    p_params.add_argument("path", help="Object path")
+
+    # tree
+    p_tree = sub.add_parser("tree", help="Show tree structure")
+    p_tree.add_argument("prefix", nargs="?", default="Device.", help="Root path (default: Device.)")
+    p_tree.add_argument("--depth", type=int, default=3, help="Max depth (default: 3)")
+
+    # fzf
+    p_fzf = sub.add_parser("fzf", help="Interactive search with fzf")
+
+    # stats
+    p_stats = sub.add_parser("stats", help="Show data model statistics")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+
+    # XML 파일 결정
+    xml_file = args.xml or os.environ.get("TR181_XML")
+    if not xml_file:
+        xml_file = find_xml_file()
+    if not xml_file:
+        print(c("  ERROR: TR-181 XML file not found.", RED))
+        print(c("  Set TR181_XML env var or place XML in the same directory.", DIM))
+        sys.exit(1)
+
+    # 파싱 / 캐시 로드
+    if args.no_cache:
+        objects, params = parse_xml(xml_file)
+    else:
+        objects, params = load_or_build_cache(xml_file)
+
+    # 서브커맨드 실행
+    dispatch = {
+        "search": cmd_search,
+        "show":   cmd_show,
+        "list":   cmd_list,
+        "params": cmd_params,
+        "tree":   cmd_tree,
+        "fzf":    cmd_fzf,
+        "stats":  cmd_stats,
+    }
+
+    dispatch[args.command](args, objects, params)
+
+if __name__ == "__main__":
+    main()
